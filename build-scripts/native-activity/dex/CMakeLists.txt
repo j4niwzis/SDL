@@ -1,0 +1,8 @@
+cmake_minimum_required(VERSION 4.3.4)
+include(${CMAKE_CURRENT_LIST_DIR}/import-std.cmake)
+set(CMAKE_CXX_STANDARD 23)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
+project(sdl-native-dex LANGUAGES CXX)
+add_executable(sdl-native-dex main.cc)
+target_sources(sdl-native-dex PRIVATE FILE_SET CXX_MODULES FILES dexfile.cc)

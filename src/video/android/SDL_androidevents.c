@@ -37,6 +37,10 @@ static void android_egl_context_restore(SDL_Window *window)
 {
     if (window && (window->flags & SDL_WINDOW_OPENGL)) {
         SDL_WindowData *data = window->internal;
+        // Fork: repeated resume commands must not restore an unsaved context.
+        if (!data->backup_done) {
+            return;
+        }
         SDL_GL_MakeCurrent(window, NULL);
         if (!SDL_GL_MakeCurrent(window, (SDL_GLContext)data->egl_context)) {
             // The context is no longer valid, create a new one
@@ -60,6 +64,10 @@ static void android_egl_context_backup(SDL_Window *window)
         int interval = 0;
         // Keep a copy of the EGL Context so we can try to restore it when we resume
         SDL_WindowData *data = window->internal;
+        // Fork: NativeActivity may have backed up before releasing its surface.
+        if (data->backup_done) {
+            return;
+        }
         data->egl_context = SDL_GL_GetCurrentContext();
 
         // Save/Restore the swap interval / vsync

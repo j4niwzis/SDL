@@ -309,6 +309,20 @@ cmake_dependent_option(SDL_PRESEED "Preseed CMake cache to speed up configuratio
 cmake_dependent_option(SDL_RELOCATABLE "Create relocatable SDL package" ${SDL_RELOCATABLE_DEFAULT} "SDL_INSTALL" OFF)
 
 cmake_dependent_option(SDL_ANDROID_JAR  "Enable creation of SDL3.jar" ${SDL3_MAINPROJECT} "ANDROID" ON)
+cmake_dependent_option(SDL_ANDROID_NATIVE_ACTIVITY
+  "Use NativeActivity and the source-generated DEX bridge" OFF "ANDROID" OFF)
+if(SDL_ANDROID_NATIVE_ACTIVITY)
+  set(SDL_ANDROID_JAR OFF)
+  # This fork's initial native profile targets touch/keyboard applications.
+  # Controller, haptic and camera integration still requires SDLActivity.
+  set(SDL_JOYSTICK OFF)
+  set(SDL_HAPTIC OFF)
+  set(SDL_HIDAPI OFF)
+  set(SDL_CAMERA OFF)
+  if(NOT SDL_VIDEO)
+    message(FATAL_ERROR "SDL_ANDROID_NATIVE_ACTIVITY requires SDL_VIDEO")
+  endif()
+endif()
 
 option_string(SDL_ASSERTIONS "Enable internal sanity checks (auto/disabled/release/enabled/paranoid)" "auto")
 set_option(SDL_ASSEMBLY            "Enable assembly routines" ${SDL_ASSEMBLY_DEFAULT})
@@ -558,8 +572,15 @@ if (LIBC_IS_GLIBC AND CMAKE_SIZEOF_VOID_P EQUAL 4)
 endif()
 
 check_linker_supports_version_file(HAVE_WL_VERSION_SCRIPT)
+set(SDL_DYNAPI_SYMBOLS "${CMAKE_CURRENT_SOURCE_DIR}/src/dynapi/SDL_dynapi.sym")
+if(SDL_ANDROID_NATIVE_ACTIVITY)
+  file(READ "${SDL_DYNAPI_SYMBOLS}" native_symbols)
+  string(REPLACE "    JNI_OnLoad;" "    JNI_OnLoad;\n    SDL_AndroidNativeActivity;" native_symbols "${native_symbols}")
+  set(SDL_DYNAPI_SYMBOLS "${CMAKE_CURRENT_BINARY_DIR}/SDL_nativeactivity.sym")
+  file(CONFIGURE OUTPUT "${SDL_DYNAPI_SYMBOLS}" CONTENT "${native_symbols}" @ONLY)
+endif()
 if(HAVE_WL_VERSION_SCRIPT)
-  sdl_shared_link_options("LINKER:SHELL:--version-script \"${CMAKE_CURRENT_SOURCE_DIR}/src/dynapi/SDL_dynapi.sym\"")
+  sdl_shared_link_options("LINKER:SHELL:--version-script \"${SDL_DYNAPI_SYMBOLS}\"")
 else()
    # When building with tcc on Linux+glibc or Android, avoid emitting an error
    # for lack of support of the version-script linker flag: the option will be
@@ -1489,10 +1510,37 @@ endif()
 if(ANDROID)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/android")
 
-  sdl_glob_sources(
-    "${SDL3_SOURCE_DIR}/src/core/android/*.c"
-    "${SDL3_SOURCE_DIR}/src/core/android/*.h"
-  )
+  if(SDL_ANDROID_NATIVE_ACTIVITY)
+    if(NOT SDL_SHARED)
+      message(FATAL_ERROR "SDL_ANDROID_NATIVE_ACTIVITY requires SDL_SHARED: the DEX bridge loads libSDL3.so")
+    endif()
+    enable_language(CXX)
+    set(CMAKE_CXX_STANDARD 17)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    target_compile_features(SDL3-shared PRIVATE cxx_std_17)
+    if(TARGET SDL3-static)
+      target_compile_features(SDL3-static PRIVATE cxx_std_17)
+    endif()
+    set(SDL_ANDROID_NATIVE_APP_GLUE "" CACHE PATH "Directory containing android_native_app_glue.c")
+    if(NOT EXISTS "${SDL_ANDROID_NATIVE_APP_GLUE}/android_native_app_glue.c")
+      message(FATAL_ERROR "Set SDL_ANDROID_NATIVE_APP_GLUE to the source-built toolchain's native_app_glue directory")
+    endif()
+    sdl_glob_sources("${SDL3_SOURCE_DIR}/src/core/android/native/*.cpp")
+    sdl_sources("${SDL_ANDROID_NATIVE_APP_GLUE}/android_native_app_glue.c")
+    set_source_files_properties("${SDL_ANDROID_NATIVE_APP_GLUE}/android_native_app_glue.c"
+      PROPERTIES COMPILE_DEFINITIONS "ANativeActivity_onCreate=SDL_NativeGlue_onCreate")
+    sdl_include_directories(PRIVATE "${SDL_ANDROID_NATIVE_APP_GLUE}")
+    sdl_shared_link_options("LINKER:-z,max-page-size=16384")
+    if(MANDK_ROOT)
+      # minimal-android-ndk keeps libc++ and its ABI in separate archives.
+      sdl_link_dependency(native_cxx LIBS c++ c++abi unwind)
+    endif()
+  else()
+    sdl_glob_sources(
+      "${SDL3_SOURCE_DIR}/src/core/android/*.c"
+      "${SDL3_SOURCE_DIR}/src/core/android/*.h"
+    )
+  endif()
 
   # Core Android code (asset I/O, logging, sensors) needs these regardless of the video subsystem.
   sdl_link_dependency(android_core LIBS dl log android)
@@ -1638,7 +1686,14 @@ if(ANDROID)
       set(SDL_VIDEO_OPENGL_ES2 1)
       set(SDL_VIDEO_RENDER_OGL_ES2 1)
 
-      sdl_link_dependency(opengles LIBS GLESv1_CM GLESv2)
+      if(SDL_ANDROID_NATIVE_ACTIVITY)
+        # The native profile needs ES 2/3, not the legacy fixed-function API.
+        set(SDL_VIDEO_OPENGL_ES 0)
+        set(SDL_VIDEO_RENDER_OGL_ES 0)
+        sdl_link_dependency(opengles LIBS GLESv2)
+      else()
+        sdl_link_dependency(opengles LIBS GLESv1_CM GLESv2)
+      endif()
     endif()
 
     if(SDL_VULKAN)
@@ -4286,8 +4341,8 @@ if(SDL_SHARED)
   set_target_properties(SDL3-shared PROPERTIES
     OUTPUT_NAME "SDL3"
     POSITION_INDEPENDENT_CODE TRUE
-    LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/dynapi/SDL_dynapi.sym"
-    INTERFACE_LINK_DEPENDS "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/src/dynapi/SDL_dynapi.sym>"
+    LINK_DEPENDS "${SDL_DYNAPI_SYMBOLS}"
+    INTERFACE_LINK_DEPENDS "$<BUILD_INTERFACE:${SDL_DYNAPI_SYMBOLS}>"
     WINDOWS_EXPORT_ALL_SYMBOLS FALSE
     DEFINE_SYMBOL "DLL_EXPORT"
   )
