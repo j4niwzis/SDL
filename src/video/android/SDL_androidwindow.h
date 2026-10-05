@@ -46,6 +46,13 @@ struct SDL_WindowData
     bool backup_done;
     ANativeWindow *native_window;
 
+    // Drawn by the CPU (SDL_androidframebuffer.c): no EGL surface is made for
+    // it, and what is drawn is kept here, pixels_w by pixels_h, XBGR8888.
+    bool framebuffer;
+    void *pixels;
+    int pixels_w;
+    int pixels_h;
+
 };
 
 #endif // SDL_androidwindow_h_

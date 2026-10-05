@@ -38,6 +38,7 @@
 #include "SDL_androidmouse.h"
 #include "SDL_androidtouch.h"
 #include "SDL_androidwindow.h"
+#include "SDL_androidframebuffer.h"
 #include "SDL_androidvulkan.h"
 #include "SDL_androidmessagebox.h"
 
@@ -122,6 +123,9 @@ static SDL_VideoDevice *Android_CreateDevice(void)
     device->MinimizeWindow = Android_MinimizeWindow;
     device->SetWindowResizable = Android_SetWindowResizable;
     device->DestroyWindow = Android_DestroyWindow;
+    device->CreateWindowFramebuffer = Android_CreateWindowFramebuffer;
+    device->UpdateWindowFramebuffer = Android_UpdateWindowFramebuffer;
+    device->DestroyWindowFramebuffer = Android_DestroyWindowFramebuffer;
 
     device->free = Android_DeleteDevice;
 

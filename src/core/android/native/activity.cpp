@@ -142,7 +142,7 @@ static void command(android_app *, int32_t cmd)
             data->native_window = Android_JNI_GetNativeWindow();
             SDL_SetPointerProperty(SDL_GetWindowProperties(Android_Window), SDL_PROP_WINDOW_ANDROID_WINDOW_POINTER, data->native_window);
 #ifdef SDL_VIDEO_OPENGL_EGL
-            if (Android_Window->flags & SDL_WINDOW_OPENGL) {
+            if ((Android_Window->flags & SDL_WINDOW_OPENGL) && !data->framebuffer) {
                 data->egl_surface = SDL_EGL_CreateSurface(SDL_GetVideoDevice(), Android_Window, data->native_window);
                 SDL_SetPointerProperty(SDL_GetWindowProperties(Android_Window), SDL_PROP_WINDOW_ANDROID_SURFACE_POINTER, data->egl_surface);
             }
