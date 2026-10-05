@@ -262,10 +262,17 @@ static void run(JNIEnv *env, jobject)
         switch (request.action) {
         case Action::show_keyboard: {
             input_type = request.type;
+            // The params the parent gave the view, resized -- never new plain
+            // ViewGroup.LayoutParams: the content FrameLayout casts its
+            // children's to MarginLayoutParams as it measures them
+            // (measureChildWithMargins), and threw ClassCastException.
             jclass params = env->FindClass("android/view/ViewGroup$LayoutParams");
-            jobject layout = env->NewObject(params, env->GetMethodID(params, "<init>", "(II)V"),
-                                           SDL_max(1, request.rect.w), SDL_max(1, request.rect.h));
-            env->CallVoidMethod(input_view, env->GetMethodID(view, "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V"), layout);
+            jobject layout = env->CallObjectMethod(input_view, env->GetMethodID(view, "getLayoutParams", "()Landroid/view/ViewGroup$LayoutParams;"));
+            if (layout) {
+                env->SetIntField(layout, env->GetFieldID(params, "width", "I"), SDL_max(1, request.rect.w));
+                env->SetIntField(layout, env->GetFieldID(params, "height", "I"), SDL_max(1, request.rect.h));
+                env->CallVoidMethod(input_view, env->GetMethodID(view, "setLayoutParams", "(Landroid/view/ViewGroup$LayoutParams;)V"), layout);
+            }
             env->CallVoidMethod(input_view, env->GetMethodID(view, "setX", "(F)V"), float(request.rect.x));
             env->CallVoidMethod(input_view, env->GetMethodID(view, "setY", "(F)V"), float(request.rect.y));
             env->CallBooleanMethod(input_view, env->GetMethodID(view, "requestFocus", "()Z"));
