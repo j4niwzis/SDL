@@ -9,7 +9,10 @@ constexpr std::uint32_t public_ = 0x1, protected_ = 0x4, static_ = 0x8;
 constexpr std::uint32_t final_ = 0x10, native_ = 0x100, constructor_ = 0x10000;
 const std::string prefix = "Lorg/libsdl/nativeapp/";
 
-std::vector<dex::Class> describe(dex::Pool &pool) {
+// `library`: what NativeActivity's static initializer loads, so that its
+// JNI_OnLoad registers the callbacks' native methods -- libSDL3.so, or the
+// application's own library where SDL is linked into it statically.
+std::vector<dex::Class> describe(dex::Pool &pool, const std::string &library) {
   std::vector<dex::Class> classes;
   const auto constructor = [&](dex::Class &type, const std::string &base,
                                std::vector<std::string> parameters) {
@@ -30,7 +33,7 @@ std::vector<dex::Class> describe(dex::Pool &pool) {
   dex::Class activity(pool, prefix + "NativeActivity;", "Landroid/app/NativeActivity;", {}, public_ | final_);
   constructor(activity, "Landroid/app/NativeActivity;", {});
   auto init = std::make_shared<dex::Code>(pool, 1, 0, 1);
-  init->constantString(0, "SDL3");
+  init->constantString(0, library);
   init->callStatic({0}, {"Ljava/lang/System;", "loadLibrary", "V", {"Ljava/lang/String;"}});
   init->returnVoid();
   activity.method("<clinit>", "V", {}, static_ | constructor_, init, true);
@@ -67,20 +70,30 @@ std::vector<dex::Class> describe(dex::Pool &pool) {
 }
 
 int main(int argc, char **argv) {
-  if (argc != 3 || std::string_view(argv[1]) != "--out") {
-    std::println(std::cerr, "usage: sdl-native-dex --out <classes.dex>");
+  const std::vector<std::string_view> args(argv + 1, argv + argc);
+  // --out <classes.dex> [--library <name>]: the name as System.loadLibrary
+  // takes it, without lib and .so; SDL3 where none is given.
+  const auto value = [&](std::string_view flag) -> std::optional<std::string> {
+    const auto found = std::ranges::find(args, flag);
+    if (found == args.end() || std::next(found) == args.end()) return std::nullopt;
+    return std::string(*std::next(found));
+  };
+  const auto out = value("--out");
+  const std::string library = value("--library").value_or("SDL3");
+  if (!out || (args.size() != 2 && args.size() != 4) || library.empty()) {
+    std::println(std::cerr, "usage: sdl-native-dex --out <classes.dex> [--library <name>]");
     return 2;
   }
   dex::Pool pool;
-  (void)describe(pool);
+  (void)describe(pool, library);
   pool.freeze();
-  auto classes = describe(pool);
+  auto classes = describe(pool, library);
   const auto bytes = dex::write(pool, classes);
-  std::ofstream out(argv[2], std::ios::binary | std::ios::trunc);
-  out.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
-  if (!out) {
-    std::println(std::cerr, "cannot write {}", argv[2]);
+  std::ofstream file(*out, std::ios::binary | std::ios::trunc);
+  file.write(reinterpret_cast<const char *>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+  if (!file) {
+    std::println(std::cerr, "cannot write {}", *out);
     return 1;
   }
-  std::println("{}: {} bytes, four native callback classes", argv[2], bytes.size());
+  std::println("{}: {} bytes, four native callback classes, loading lib{}.so", *out, bytes.size(), library);
 }

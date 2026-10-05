@@ -1511,13 +1511,16 @@ if(ANDROID)
   list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_LIST_DIR}/cmake/android")
 
   if(SDL_ANDROID_NATIVE_ACTIVITY)
-    if(NOT SDL_SHARED)
-      message(FATAL_ERROR "SDL_ANDROID_NATIVE_ACTIVITY requires SDL_SHARED: the DEX bridge loads libSDL3.so")
-    endif()
+    # Shared, the DEX bridge loads libSDL3.so. Static, SDL is in the
+    # application's library: the DEX is generated with --library <its name>,
+    # and that library exports JNI_OnLoad (from this archive) as well as
+    # ANativeActivity_onCreate.
     enable_language(CXX)
     set(CMAKE_CXX_STANDARD 17)
     set(CMAKE_CXX_STANDARD_REQUIRED ON)
-    target_compile_features(SDL3-shared PRIVATE cxx_std_17)
+    if(TARGET SDL3-shared)
+      target_compile_features(SDL3-shared PRIVATE cxx_std_17)
+    endif()
     if(TARGET SDL3-static)
       target_compile_features(SDL3-static PRIVATE cxx_std_17)
     endif()
