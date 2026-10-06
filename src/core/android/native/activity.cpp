@@ -8,6 +8,7 @@
 #include <climits>
 #include <algorithm>
 #include <atomic>
+#include <optional>
 
 extern "C" void SDL_NativeGlue_onCreate(ANativeActivity *, void *, size_t);
 
@@ -90,6 +91,69 @@ jobject service(JNIEnv *env, const char *name)
     return method ? env->CallObjectMethod(activity, method, env->NewStringUTF(name)) : nullptr;
 }
 
+struct Edges
+{
+    int left = 0, top = 0, right = 0, bottom = 0;
+};
+
+// What the status and navigation bars and a display cutout cover of the window, in
+// pixels: WindowInsets.getInsets(systemBars() | displayCutout()) from API 30, the
+// system window insets before it; nothing before API 23 or before the view is attached.
+static std::optional<Edges> system_bars_in(JNIEnv *env)
+{
+    const auto object_of = [env](jobject target, const char *name, const char *signature) -> jobject {
+        if (!target) return nullptr;
+        jmethodID method = env->GetMethodID(env->GetObjectClass(target), name, signature);
+        if (!method) { env->ExceptionClear(); return nullptr; }
+        jobject result = env->CallObjectMethod(target, method);
+        return exception(env, name) ? nullptr : result;
+    };
+    jobject window = object_of(activity, "getWindow", "()Landroid/view/Window;");
+    jobject decor = object_of(window, "getDecorView", "()Landroid/view/View;");
+    jobject insets = object_of(decor, "getRootWindowInsets", "()Landroid/view/WindowInsets;");
+    if (!insets) return std::nullopt;
+
+    const auto int_of = [env](jobject target, const char *name) {
+        jmethodID method = env->GetMethodID(env->GetObjectClass(target), name, "()I");
+        if (!method) { env->ExceptionClear(); return 0; }
+        const jint value = env->CallIntMethod(target, method);
+        return exception(env, name) ? 0 : int(value);
+    };
+    const auto type_of = [env](jclass types, const char *name) {
+        jmethodID method = env->GetStaticMethodID(types, name, "()I");
+        if (!method) { env->ExceptionClear(); return 0; }
+        const jint value = env->CallStaticIntMethod(types, method);
+        return exception(env, name) ? 0 : int(value);
+    };
+    jclass types = env->FindClass("android/view/WindowInsets$Type");
+    if (!types) {
+        env->ExceptionClear();
+        return Edges{int_of(insets, "getSystemWindowInsetLeft"), int_of(insets, "getSystemWindowInsetTop"),
+                     int_of(insets, "getSystemWindowInsetRight"), int_of(insets, "getSystemWindowInsetBottom")};
+    }
+    const jint mask = type_of(types, "systemBars") | type_of(types, "displayCutout");
+    jmethodID get = env->GetMethodID(env->GetObjectClass(insets), "getInsets", "(I)Landroid/graphics/Insets;");
+    if (!get) { env->ExceptionClear(); return std::nullopt; }
+    jobject sides = env->CallObjectMethod(insets, get, mask);
+    if (exception(env, "getInsets") || !sides) return std::nullopt;
+    jclass sides_class = env->GetObjectClass(sides);
+    const auto side = [env, sides, sides_class](const char *name) {
+        jfieldID field = env->GetFieldID(sides_class, name, "I");
+        if (!field) { env->ExceptionClear(); return 0; }
+        return int(env->GetIntField(sides, field));
+    };
+    return Edges{side("left"), side("top"), side("right"), side("bottom")};
+}
+
+// The app thread never returns to Java, so its local references are freed by a frame.
+static std::optional<Edges> system_bars(JNIEnv *env)
+{
+    if (!env || !activity || env->PushLocalFrame(16) != JNI_OK) return std::nullopt;
+    const auto edges = system_bars_in(env);
+    env->PopLocalFrame(nullptr);
+    return edges;
+}
+
 void resize()
 {
     if (!app || !app->window) return;
@@ -100,11 +164,17 @@ void resize()
     Android_SetScreenResolution(width, height, width, height, float(dpi) / 160.0f, 60.0f);
     Android_SetFormat(ANativeWindow_getFormat(app->window), ANativeWindow_getFormat(app->window));
     if (Android_Window) Android_SendResize(Android_Window);
+    // Since API 35 the window is drawn edge to edge: the content rect then covers the
+    // system bars, so what they cover is read from the window's insets as well.
     const ARect &rect = app->contentRect;
-    if (rect.right > rect.left && rect.bottom > rect.top) {
-        Android_SetWindowSafeAreaInsets(rect.left, SDL_max(0, width - rect.right),
-                                       rect.top, SDL_max(0, height - rect.bottom));
+    Edges edges = rect.right > rect.left && rect.bottom > rect.top
+        ? Edges{rect.left, rect.top, SDL_max(0, width - rect.right), SDL_max(0, height - rect.bottom)}
+        : Edges{};
+    if (const auto bars = system_bars(Android_JNI_GetEnv())) {
+        edges = {SDL_max(edges.left, bars->left), SDL_max(edges.top, bars->top),
+                 SDL_max(edges.right, bars->right), SDL_max(edges.bottom, bars->bottom)};
     }
+    Android_SetWindowSafeAreaInsets(edges.left, edges.right, edges.top, edges.bottom);
 }
 
 static void release_surface()
