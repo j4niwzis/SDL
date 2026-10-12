@@ -25,6 +25,9 @@ static pthread_once_t attachment_once = PTHREAD_ONCE_INIT;
 static bool resumed;
 static bool quitting;
 static std::atomic<bool> back_trapped;
+// The window's insets moved -- the keyboard shown or hidden -- on the UI thread:
+// the safe area read again by the app thread.
+static std::atomic<bool> insets_moved;
 
 static void detach(void *value)
 {
@@ -96,9 +99,12 @@ struct Edges
     int left = 0, top = 0, right = 0, bottom = 0;
 };
 
-// What the status and navigation bars and a display cutout cover of the window, in
-// pixels: WindowInsets.getInsets(systemBars() | displayCutout()) from API 30, the
-// system window insets before it; nothing before API 23 or before the view is attached.
+// What the status and navigation bars, a display cutout and the keyboard cover of
+// the window, in pixels: WindowInsets.getInsets(systemBars() | displayCutout() | ime())
+// from API 30, the system window insets (the keyboard's with them, under adjustResize)
+// before it; nothing before API 23 or before the view is attached. Since API 35 the
+// window is edge to edge and is not resized for the keyboard: only its inset says
+// where it is.
 static std::optional<Edges> system_bars_in(JNIEnv *env)
 {
     const auto object_of = [env](jobject target, const char *name, const char *signature) -> jobject {
@@ -131,7 +137,7 @@ static std::optional<Edges> system_bars_in(JNIEnv *env)
         return Edges{int_of(insets, "getSystemWindowInsetLeft"), int_of(insets, "getSystemWindowInsetTop"),
                      int_of(insets, "getSystemWindowInsetRight"), int_of(insets, "getSystemWindowInsetBottom")};
     }
-    const jint mask = type_of(types, "systemBars") | type_of(types, "displayCutout");
+    const jint mask = type_of(types, "systemBars") | type_of(types, "displayCutout") | type_of(types, "ime");
     jmethodID get = env->GetMethodID(env->GetObjectClass(insets), "getInsets", "(I)Landroid/graphics/Insets;");
     if (!get) { env->ExceptionClear(); return std::nullopt; }
     jobject sides = env->CallObjectMethod(insets, get, mask);
@@ -152,6 +158,12 @@ static std::optional<Edges> system_bars(JNIEnv *env)
     const auto edges = system_bars_in(env);
     env->PopLocalFrame(nullptr);
     return edges;
+}
+
+void insets_changed()
+{
+    insets_moved = true;
+    if (app && app->looper) ALooper_wake(app->looper);
 }
 
 void resize()
@@ -392,6 +404,11 @@ bool Android_WaitLifecycleEvent(SDL_AndroidLifecycleEvent *event, Sint64 timeout
     const Uint64 start = SDL_GetTicksNS();
     for (;;) {
         pump_documents();
+        if (insets_moved.exchange(false)) {
+            Android_LockActivityMutex();
+            resize();
+            Android_UnlockActivityMutex();
+        }
         SDL_LockMutex(event_mutex);
         if (!pending.empty()) {
             *event = pending.front();

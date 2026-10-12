@@ -50,4 +50,6 @@ void document_result(JNIEnv *env, jint request, jint result, jobject data);
 void pump_documents();
 void clear_documents();
 void resize();
+// The window's insets moved, told from the UI thread: the app thread resizes.
+void insets_changed();
 }

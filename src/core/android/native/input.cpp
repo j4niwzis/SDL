@@ -207,6 +207,7 @@ static jobject insets(JNIEnv *env, jobject self, jobject value)
             Android_UnlockActivityMutex();
         }
     }
+    insets_changed();
     jclass base = env->FindClass("android/view/View");
     return env->CallNonvirtualObjectMethod(self, base, env->GetMethodID(base, "onApplyWindowInsets",
         "(Landroid/view/WindowInsets;)Landroid/view/WindowInsets;"), value);
