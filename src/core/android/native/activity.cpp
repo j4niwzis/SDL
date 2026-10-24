@@ -6,6 +6,8 @@
 #include <android/window.h>
 #include <pthread.h>
 #include <climits>
+#include <cstdarg>
+#include <cstdio>
 #include <algorithm>
 #include <atomic>
 #include <optional>
@@ -330,9 +332,23 @@ static int32_t input(android_app *, AInputEvent *event)
 // stayed out of its looper as long.
 constexpr Uint64 kStalledMs = 2000;
 
+// A line of the watchdog's: in logcat under its tag, and on stderr too --
+// where the program keeps its own log (mux carries stderr to logcat and
+// keeps it for Copy log), it is among the rest.
+[[gnu::format(printf, 1, 2)]] static void say_watch(const char *format, ...)
+{
+    char line[512];
+    va_list args;
+    va_start(args, format);
+    std::vsnprintf(line, sizeof line, format, args);
+    va_end(args);
+    __android_log_write(ANDROID_LOG_WARN, "mux-watch", line);
+    std::fprintf(stderr, "[mux-watch] %s\n", line);
+}
+
 static void log_main_stack(JNIEnv *env, Uint64 waited)
 {
-    __android_log_print(ANDROID_LOG_WARN, "mux-watch", "UI thread has not answered for %llu ms; it is at:",
+    say_watch("UI thread has not answered for %llu ms; it is at:",
                         static_cast<unsigned long long>(waited));
     Frame frame(env);
     if (!frame) return;
@@ -350,7 +366,7 @@ static void log_main_stack(JNIEnv *env, Uint64 waited)
         jobject one = env->GetObjectArrayElement(frames, i);
         auto line = static_cast<jstring>(env->CallObjectMethod(one, text));
         if (exception(env, "UI thread frame")) return;
-        __android_log_print(ANDROID_LOG_WARN, "mux-watch", "    at %s", utf8(env, line).c_str());
+        say_watch("    at %s", utf8(env, line).c_str());
         env->DeleteLocalRef(line);
         env->DeleteLocalRef(one);
     }
@@ -377,7 +393,7 @@ static void watch()
             }
         } else {
             if (told_ui)
-                __android_log_print(ANDROID_LOG_WARN, "mux-watch", "UI thread answered after %llu ms",
+                say_watch("UI thread answered after %llu ms",
                                     static_cast<unsigned long long>(now - asked));
             told_ui = false;
             if (asked == 0 || now - asked >= 1000) {
@@ -388,10 +404,10 @@ static void watch()
         const Uint64 left = app_left_poll;
         const bool out = !app_polling && left != 0 && now - left > kStalledMs;
         if (out && !told_app)
-            __android_log_print(ANDROID_LOG_WARN, "mux-watch", "app thread out of its looper for %llu ms (in a frame or the app's work)",
+            say_watch("app thread out of its looper for %llu ms (in a frame or the app's work)",
                                 static_cast<unsigned long long>(now - left));
         if (!out && told_app)
-            __android_log_print(ANDROID_LOG_WARN, "mux-watch", "app thread back in its looper");
+            say_watch("app thread back in its looper");
         told_app = out;
     }
 }
