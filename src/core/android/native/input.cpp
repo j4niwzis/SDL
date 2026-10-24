@@ -21,6 +21,45 @@ struct Request {
 static std::mutex requests_mutex;
 static std::deque<Request> requests;
 
+// What the UI thread was told, for the app thread (tell, drain_input): held
+// only as long as it takes to add or take, never across SDL's own work.
+static std::mutex said_mutex;
+static std::deque<input_said> said_queue;
+
+void tell(input_said what)
+{
+    {
+        const std::lock_guard<std::mutex> lock(said_mutex);
+        said_queue.push_back(std::move(what));
+    }
+    if (app && app->looper) ALooper_wake(app->looper);
+}
+
+namespace {
+struct give {
+    void operator()(const said::text &one) const { SDL_SendKeyboardText(one.utf8.c_str()); }
+    void operator()(const said::editing &one) const { SDL_SendEditingText(one.utf8.c_str(), one.length, 0); }
+    void operator()(const said::tapped &one) const { SDL_SendKeyboardKeyAutoRelease(0, one.code); }
+    void operator()(const said::key_down &one) const { Android_OnKeyDown(one.code); }
+    void operator()(const said::key_up &one) const { Android_OnKeyUp(one.code); }
+    void operator()(const said::keyboard_shown &) const { SDL_SendScreenKeyboardShown(); }
+    void operator()(const said::keyboard_hidden &) const { SDL_SendScreenKeyboardHidden(); }
+};
+}
+
+void drain_input()
+{
+    std::deque<input_said> work;
+    {
+        const std::lock_guard<std::mutex> lock(said_mutex);
+        work.swap(said_queue);
+    }
+    if (work.empty()) return;
+    Android_LockActivityMutex();
+    for (const input_said &one : work) std::visit(give{}, one);
+    Android_UnlockActivityMutex();
+}
+
 static bool enqueue(Request request)
 {
     auto *env = Android_JNI_GetEnv();
@@ -89,11 +128,9 @@ static void synchronize_text(JNIEnv *env, jobject self)
     while (common < text.size() && common < committed.size() && text[common] == committed[common]) ++common;
     // A common high surrogate is not a common character.
     if (common && common < committed.size() && committed[common - 1] >= 0xd800 && committed[common - 1] <= 0xdbff) --common;
-    Android_LockActivityMutex();
-    for (size_t n = codepoints(committed, common); n; --n) SDL_SendKeyboardKeyAutoRelease(0, SDL_SCANCODE_BACKSPACE);
-    if (common < text.size()) SDL_SendKeyboardText(text_utf8(env, text.substr(common)).c_str());
-    SDL_SendEditingText(text_utf8(env, composition).c_str(), int(codepoints(composition)), 0);
-    Android_UnlockActivityMutex();
+    for (size_t n = codepoints(committed, common); n; --n) tell(said::tapped{SDL_SCANCODE_BACKSPACE});
+    if (common < text.size()) tell(said::text{text_utf8(env, text.substr(common))});
+    tell(said::editing{text_utf8(env, composition), int(codepoints(composition))});
     committed = std::move(text);
 }
 
@@ -148,10 +185,8 @@ static jboolean erase(JNIEnv *env, jobject self, jint before, jint after, bool p
     if (!done || exception(env, "delete text")) return false;
     synchronize_text(env, self);
     // The app can contain text typed before this input connection existed.
-    Android_LockActivityMutex();
-    for (size_t n = available_before; n < size_t(before); ++n) SDL_SendKeyboardKeyAutoRelease(0, SDL_SCANCODE_BACKSPACE);
-    for (size_t n = available_after; n < size_t(after); ++n) SDL_SendKeyboardKeyAutoRelease(0, SDL_SCANCODE_DELETE);
-    Android_UnlockActivityMutex();
+    for (size_t n = available_before; n < size_t(before); ++n) tell(said::tapped{SDL_SCANCODE_BACKSPACE});
+    for (size_t n = available_after; n < size_t(after); ++n) tell(said::tapped{SDL_SCANCODE_DELETE});
     return true;
 }
 static jboolean erase_units(JNIEnv *e, jobject s, jint b, jint a) { return erase(e, s, b, a, false); }
@@ -167,18 +202,16 @@ static jboolean key(JNIEnv *env, jobject, jobject event)
     if (exception(env, "read key event")) return false;
     // Let Android handle system navigation and volume keys.
     if (code == AKEYCODE_BACK || code == AKEYCODE_VOLUME_UP || code == AKEYCODE_VOLUME_DOWN) return false;
-    Android_LockActivityMutex();
-    if (action == AKEY_EVENT_ACTION_DOWN) Android_OnKeyDown(code);
-    else if (action == AKEY_EVENT_ACTION_UP) Android_OnKeyUp(code);
+    if (action == AKEY_EVENT_ACTION_DOWN) tell(said::key_down{code});
+    else if (action == AKEY_EVENT_ACTION_UP) tell(said::key_up{code});
     if (action == AKEY_EVENT_ACTION_DOWN) {
         jint c = env->CallIntMethod(event, env->GetMethodID(cls, "getUnicodeChar", "()I"));
         if (c >= 32 && c <= 0x10ffff) {
             char text[5]{};
             SDL_UCS4ToUTF8(c, text);
-            SDL_SendKeyboardText(text);
+            tell(said::text{text});
         }
     }
-    Android_UnlockActivityMutex();
     return !exception(env, "key input");
 }
 
@@ -187,9 +220,7 @@ static jboolean pre_ime(JNIEnv *env, jobject, jint code, jobject event)
 {
     if (code == AKEYCODE_BACK && env->CallIntMethod(event,
         env->GetMethodID(env->GetObjectClass(event), "getAction", "()I")) == AKEY_EVENT_ACTION_UP) {
-        Android_LockActivityMutex();
-        SDL_SendScreenKeyboardHidden();
-        Android_UnlockActivityMutex();
+        tell(said::keyboard_hidden{});
     }
     return false; // The IME still receives Back and performs the dismissal.
 }
@@ -201,10 +232,8 @@ static jobject insets(JNIEnv *env, jobject self, jobject value)
         jint mask = env->CallStaticIntMethod(type, env->GetStaticMethodID(type, "ime", "()I"));
         bool visible = env->CallBooleanMethod(value, env->GetMethodID(env->GetObjectClass(value), "isVisible", "(I)Z"), mask);
         if (!exception(env, "keyboard insets")) {
-            Android_LockActivityMutex();
-            if (visible) SDL_SendScreenKeyboardShown();
-            else SDL_SendScreenKeyboardHidden();
-            Android_UnlockActivityMutex();
+            if (visible) tell(said::keyboard_shown{});
+            else tell(said::keyboard_hidden{});
         }
     }
     insets_changed();
@@ -280,11 +309,8 @@ static void run(JNIEnv *env, jobject)
             jobject manager = service(env, "input_method");
             jclass cls = env->GetObjectClass(manager);
             env->CallVoidMethod(manager, env->GetMethodID(cls, "restartInput", "(Landroid/view/View;)V"), input_view);
-            if (env->CallBooleanMethod(manager, env->GetMethodID(cls, "showSoftInput", "(Landroid/view/View;I)Z"), input_view, 0)) {
-                Android_LockActivityMutex();
-                SDL_SendScreenKeyboardShown();
-                Android_UnlockActivityMutex();
-            }
+            if (env->CallBooleanMethod(manager, env->GetMethodID(cls, "showSoftInput", "(Landroid/view/View;I)Z"), input_view, 0))
+                tell(said::keyboard_shown{});
             break;
         }
         case Action::hide_keyboard: {
@@ -292,9 +318,7 @@ static void run(JNIEnv *env, jobject)
             jobject token = env->CallObjectMethod(input_view, env->GetMethodID(view, "getWindowToken", "()Landroid/os/IBinder;"));
             env->CallBooleanMethod(manager, env->GetMethodID(env->GetObjectClass(manager), "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z"), token, 0);
             env->CallVoidMethod(input_view, env->GetMethodID(view, "clearFocus", "()V"));
-            Android_LockActivityMutex();
-            SDL_SendScreenKeyboardHidden();
-            Android_UnlockActivityMutex();
+            tell(said::keyboard_hidden{});
             break;
         }
         case Action::title:
@@ -366,6 +390,10 @@ void release_bridge(JNIEnv *env)
 {
     const std::lock_guard<std::mutex> lock(requests_mutex);
     requests.clear();
+    {
+        const std::lock_guard<std::mutex> said_lock(said_mutex);
+        said_queue.clear();
+    }
     for (jobject *ref : {&input_view, &connection, &runner}) {
         if (*ref) env->DeleteGlobalRef(*ref);
         *ref = nullptr;

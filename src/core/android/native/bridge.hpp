@@ -19,6 +19,7 @@ extern "C" {
 }
 
 #include <string>
+#include <variant>
 #include <vector>
 
 namespace native_activity {
@@ -52,4 +53,27 @@ void clear_documents();
 void resize();
 // The window's insets moved, told from the UI thread: the app thread resizes.
 void insets_changed();
+
+// What the UI thread was told -- typed, committed, a key, the keyboard shown
+// or hidden -- handed to the app thread, which gives it to SDL. The UI thread
+// never waits on the activity mutex: the app thread holds it across every
+// frame's eglSwapBuffers, and a swap that blocked held up Android's own
+// thread behind it -- "isn't responding", over and over, while the app
+// itself went on.
+namespace said {
+struct text { std::string utf8; };
+struct editing { std::string utf8; int length; };
+struct tapped { SDL_Scancode code; };  // pressed and let go: Backspace, Delete
+struct key_down { int code; };
+struct key_up { int code; };
+struct keyboard_shown {};
+struct keyboard_hidden {};
+}
+using input_said = std::variant<said::text, said::editing, said::tapped, said::key_down, said::key_up,
+                                said::keyboard_shown, said::keyboard_hidden>;
+// From the UI thread: kept, and the app thread's looper woken.
+void tell(input_said what);
+// On the app thread, as it waits for events: what the UI thread told, given
+// to SDL in the order it came.
+void drain_input();
 }

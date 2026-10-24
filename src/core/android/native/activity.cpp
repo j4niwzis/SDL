@@ -404,6 +404,7 @@ bool Android_WaitLifecycleEvent(SDL_AndroidLifecycleEvent *event, Sint64 timeout
     const Uint64 start = SDL_GetTicksNS();
     for (;;) {
         pump_documents();
+        drain_input();
         if (insets_moved.exchange(false)) {
             Android_LockActivityMutex();
             resize();
