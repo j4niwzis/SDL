@@ -9,6 +9,8 @@
 #include <algorithm>
 #include <atomic>
 #include <optional>
+#include <string>
+#include <thread>
 
 extern "C" void SDL_NativeGlue_onCreate(ANativeActivity *, void *, size_t);
 
@@ -22,12 +24,17 @@ static SDL_Mutex *event_mutex;
 static std::vector<SDL_AndroidLifecycleEvent> pending;
 static pthread_key_t attachment;
 static pthread_once_t attachment_once = PTHREAD_ONCE_INIT;
-static bool resumed;
+static std::atomic<bool> resumed;
 static bool quitting;
 static std::atomic<bool> back_trapped;
 // The window's insets moved -- the keyboard shown or hidden -- on the UI thread:
 // the safe area read again by the app thread.
 static std::atomic<bool> insets_moved;
+// The app thread in ALooper_pollOnce -- serving what the UI thread and the
+// input queue wait on -- and when it last came out of it.
+static std::atomic<bool> app_polling;
+static std::atomic<Uint64> app_left_poll;
+static std::atomic<bool> watching;
 
 static void detach(void *value)
 {
@@ -313,6 +320,81 @@ static int32_t input(android_app *, AInputEvent *event)
     }
     return 0;
 }
+
+// "Isn't responding", while the app goes on drawing: what keeps Android's UI
+// thread or the app thread from answering, said in logcat (tag mux-watch).
+// Each touch is finished on the app thread and acknowledged to the system on
+// the UI thread (InputQueue's MSG_FINISH_INPUT), so either one held up past
+// five seconds is an ANR. Once a second the UI thread is pinged; unanswered
+// for two, its Java stack is logged -- and the app thread said where it has
+// stayed out of its looper as long.
+constexpr Uint64 kStalledMs = 2000;
+
+static void log_main_stack(JNIEnv *env, Uint64 waited)
+{
+    __android_log_print(ANDROID_LOG_WARN, "mux-watch", "UI thread has not answered for %llu ms; it is at:",
+                        static_cast<unsigned long long>(waited));
+    Frame frame(env);
+    if (!frame) return;
+    jclass looper = env->FindClass("android/os/Looper");
+    jobject main = looper ? env->CallStaticObjectMethod(looper, env->GetStaticMethodID(looper, "getMainLooper", "()Landroid/os/Looper;")) : nullptr;
+    jobject thread = main ? env->CallObjectMethod(main, env->GetMethodID(looper, "getThread", "()Ljava/lang/Thread;")) : nullptr;
+    jclass thread_class = env->FindClass("java/lang/Thread");
+    auto frames = thread ? static_cast<jobjectArray>(env->CallObjectMethod(thread,
+        env->GetMethodID(thread_class, "getStackTrace", "()[Ljava/lang/StackTraceElement;"))) : nullptr;
+    if (exception(env, "UI thread stack") || !frames) return;
+    jclass element = env->FindClass("java/lang/StackTraceElement");
+    jmethodID text = env->GetMethodID(element, "toString", "()Ljava/lang/String;");
+    const jsize count = std::min<jsize>(env->GetArrayLength(frames), 40);
+    for (jsize i = 0; i < count; ++i) {
+        jobject one = env->GetObjectArrayElement(frames, i);
+        auto line = static_cast<jstring>(env->CallObjectMethod(one, text));
+        if (exception(env, "UI thread frame")) return;
+        __android_log_print(ANDROID_LOG_WARN, "mux-watch", "    at %s", utf8(env, line).c_str());
+        env->DeleteLocalRef(line);
+        env->DeleteLocalRef(one);
+    }
+}
+
+static void watch()
+{
+    JNIEnv *env = Android_JNI_GetEnv();
+    Uint64 asked = 0;
+    bool told_ui = false, told_app = false;
+    while (watching) {
+        SDL_Delay(250);
+        const Uint64 now = SDL_GetTicks();
+        // Paused, the activity is not asked to answer anything.
+        if (!resumed) {
+            asked = 0;
+            told_ui = told_app = false;
+            continue;
+        }
+        if (asked != 0 && ui_answered < asked) {
+            if (!told_ui && now - asked > kStalledMs) {
+                log_main_stack(env, now - asked);
+                told_ui = true;
+            }
+        } else {
+            if (told_ui)
+                __android_log_print(ANDROID_LOG_WARN, "mux-watch", "UI thread answered after %llu ms",
+                                    static_cast<unsigned long long>(now - asked));
+            told_ui = false;
+            if (asked == 0 || now - asked >= 1000) {
+                asked = now;
+                ping_ui(now);
+            }
+        }
+        const Uint64 left = app_left_poll;
+        const bool out = !app_polling && left != 0 && now - left > kStalledMs;
+        if (out && !told_app)
+            __android_log_print(ANDROID_LOG_WARN, "mux-watch", "app thread out of its looper for %llu ms (in a frame or the app's work)",
+                                static_cast<unsigned long long>(now - left));
+        if (!out && told_app)
+            __android_log_print(ANDROID_LOG_WARN, "mux-watch", "app thread back in its looper");
+        told_app = out;
+    }
+}
 } // namespace native_activity
 
 using namespace native_activity;
@@ -352,7 +434,11 @@ extern "C" void android_main(android_app *native)
         char name[] = "SDL-native-activity";
         char *arguments[] = {name, nullptr};
         SDL_SetMainReady();
+        watching = true;
+        std::thread watchdog(watch);
         main_function(1, arguments);
+        watching = false;
+        watchdog.join();
         clear_documents();
         ANativeActivity_finish(app->activity);
     }
@@ -423,8 +509,11 @@ bool Android_WaitLifecycleEvent(SDL_AndroidLifecycleEvent *event, Sint64 timeout
         int milliseconds = remaining < 0 ? -1 : int(SDL_min(Sint64(INT_MAX), (remaining + 999999) / 1000000));
         int events;
         android_poll_source *source = nullptr;
+        app_polling = true;
         int result = ALooper_pollOnce(milliseconds, nullptr, &events, reinterpret_cast<void **>(&source));
         if (result >= 0 && source) source->process(app, source);
+        app_left_poll = SDL_GetTicks();
+        app_polling = false;
         if (result == ALOOPER_POLL_TIMEOUT || result == ALOOPER_POLL_ERROR) return false;
         if (result == ALOOPER_POLL_WAKE) {
             *event = SDL_ANDROID_LIFECYCLE_WAKE;

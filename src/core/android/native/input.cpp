@@ -11,12 +11,13 @@ static jobject input_view, connection, runner;
 static int input_type = 1;
 static std::u16string committed;
 
-enum class Action { show_keyboard, hide_keyboard, title, minimize, open_url, document };
+enum class Action { show_keyboard, hide_keyboard, title, minimize, open_url, document, ping };
 struct Request {
     Action action;
     int type = 0;
     SDL_Rect rect{};
     std::string text;
+    Uint64 stamp = 0;  // a ping's: when it was asked, answered as the UI thread runs it
 };
 static std::mutex requests_mutex;
 static std::deque<Request> requests;
@@ -338,6 +339,9 @@ static void run(JNIEnv *env, jobject)
         case Action::document:
             open_document_on_ui(env, request.type, request.text);
             break;
+        case Action::ping:
+            ui_answered = request.stamp;
+            break;
         }
         exception(env, "UI request");
     }
@@ -401,6 +405,8 @@ void release_bridge(JNIEnv *env)
     committed.clear();
 }
 
+std::atomic<Uint64> ui_answered{0};
+void ping_ui(Uint64 stamp) { enqueue({Action::ping, 0, {}, {}, stamp}); }
 void show_keyboard(int type, const SDL_Rect &rect) { enqueue({Action::show_keyboard, type, rect, {}}); }
 void hide_keyboard() { enqueue({Action::hide_keyboard}); }
 bool request_document(int type, const char *name) { return enqueue({Action::document, type, {}, name ? name : ""}); }

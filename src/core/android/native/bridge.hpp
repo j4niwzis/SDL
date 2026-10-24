@@ -18,6 +18,7 @@ extern "C" {
 #include <SDL3/SDL_nativeactivity.h>
 }
 
+#include <atomic>
 #include <string>
 #include <variant>
 #include <vector>
@@ -71,6 +72,11 @@ struct keyboard_hidden {};
 }
 using input_said = std::variant<said::text, said::editing, said::tapped, said::key_down, said::key_up,
                                 said::keyboard_shown, said::keyboard_hidden>;
+// The watchdog's ping (watch, in activity.cpp): asked of the UI thread
+// through runOnUiThread, answered there with when it was asked.
+void ping_ui(Uint64 stamp);
+extern std::atomic<Uint64> ui_answered;
+
 // From the UI thread: kept, and the app thread's looper woken.
 void tell(input_said what);
 // On the app thread, as it waits for events: what the UI thread told, given
