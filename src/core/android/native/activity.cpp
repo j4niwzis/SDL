@@ -402,7 +402,9 @@ static void watch()
             }
         }
         const Uint64 left = app_left_poll;
-        const bool out = !app_polling && left != 0 && now - left > kStalledMs;
+        // Left after `now` was read -- the app thread polled again since --
+        // is no stall: unsigned, `now - left` came out as 2^64 - 1 ms.
+        const bool out = !app_polling && left != 0 && left <= now && now - left > kStalledMs;
         if (out && !told_app)
             say_watch("app thread out of its looper for %llu ms (in a frame or the app's work)",
                                 static_cast<unsigned long long>(now - left));
