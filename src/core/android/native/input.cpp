@@ -4,21 +4,96 @@
 #include <algorithm>
 #include <mutex>
 #include <deque>
+#include <optional>
+#include <tuple>
 
 namespace native_activity {
 static jclass activity_class, view_class, connection_class, runner_class;
 static jobject input_view, connection, runner;
 static int input_type = 1;
+static void take_request(JNIEnv *env, jobject intent);
 static std::u16string committed;
 
-enum class Action { show_keyboard, hide_keyboard, title, minimize, open_url, document, ping };
+enum class Action { show_keyboard, hide_keyboard, title, minimize, open_url, document, ping, editor_state };
 struct Request {
     Action action;
     int type = 0;
     SDL_Rect rect{};
     std::string text;
     Uint64 stamp = 0;  // a ping's: when it was asked, answered as the UI thread runs it
+    int anchor = 0, caret = 0;  // an editor state's selection, in bytes of `text`
 };
+
+// The field typed into, as the app says it is (SDL_SetAndroidEditorState):
+// the input connection's text is it, and the input method edits it whole --
+// its own caret where the app's is. Said as a whole too, what the input
+// method made of it (SDL_TakeAndroidEditorState). Where the app says
+// nothing, the input method is given an empty text, and what it types is
+// told as keys and text at the app's caret, as before.
+static bool state_mode = false;
+static std::u16string field_text;
+static jint field_anchor = 0, field_caret = 0;
+static std::mutex edited_mutex;
+static std::optional<std::tuple<std::string, int, int>> edited_state;
+
+// UTF-8 and UTF-16, and offsets between them.
+static std::u16string utf16_of(const std::string &text)
+{
+    std::u16string out;
+    for (size_t i = 0; i < text.size();) {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        const size_t length = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+        char32_t point = length == 1 ? lead : length == 2 ? (lead & 0x1f) : length == 3 ? (lead & 0x0f) : (lead & 0x07);
+        for (size_t k = 1; k < length && i + k < text.size(); ++k)
+            point = (point << 6) | (static_cast<unsigned char>(text[i + k]) & 0x3f);
+        i += length;
+        if (point >= 0x10000) {
+            point -= 0x10000;
+            out.push_back(char16_t(0xd800 + (point >> 10)));
+            out.push_back(char16_t(0xdc00 + (point & 0x3ff)));
+        } else {
+            out.push_back(char16_t(point));
+        }
+    }
+    return out;
+}
+static std::string utf8_of(const std::u16string &text)
+{
+    std::string out;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char32_t point = text[i];
+        if (point >= 0xd800 && point <= 0xdbff && i + 1 < text.size() && text[i + 1] >= 0xdc00 && text[i + 1] <= 0xdfff)
+            point = 0x10000 + ((point - 0xd800) << 10) + (text[++i] - 0xdc00);
+        if (point < 0x80) {
+            out.push_back(char(point));
+        } else if (point < 0x800) {
+            out.push_back(char(0xc0 | (point >> 6)));
+            out.push_back(char(0x80 | (point & 0x3f)));
+        } else if (point < 0x10000) {
+            out.push_back(char(0xe0 | (point >> 12)));
+            out.push_back(char(0x80 | ((point >> 6) & 0x3f)));
+            out.push_back(char(0x80 | (point & 0x3f)));
+        } else {
+            out.push_back(char(0xf0 | (point >> 18)));
+            out.push_back(char(0x80 | ((point >> 12) & 0x3f)));
+            out.push_back(char(0x80 | ((point >> 6) & 0x3f)));
+            out.push_back(char(0x80 | (point & 0x3f)));
+        }
+    }
+    return out;
+}
+// A byte offset into UTF-8 text as code units of the same text in UTF-16.
+static jint units_at(const std::string &text, size_t bytes)
+{
+    jint units = 0;
+    for (size_t i = 0; i < text.size() && i < bytes;) {
+        const unsigned char lead = static_cast<unsigned char>(text[i]);
+        const size_t length = lead < 0x80 ? 1 : lead < 0xe0 ? 2 : lead < 0xf0 ? 3 : 4;
+        units += length == 4 ? 2 : 1;
+        i += length;
+    }
+    return units;
+}
 static std::mutex requests_mutex;
 static std::deque<Request> requests;
 
@@ -109,11 +184,56 @@ static std::string text_utf8(JNIEnv *env, const std::u16string &text)
     return utf8(env, env->NewString(reinterpret_cast<const jchar *>(text.data()), jsize(text.size())));
 }
 
+// The connection's text made the field's, its selection the field's, and
+// what the input method composes let go: the input method told where it is.
+static void seed(JNIEnv *env, jobject with)
+{
+    jobject content = editable(env, with);
+    if (!content || exception(env, "read editor to seed")) return;
+    jclass editable_class = env->FindClass("android/text/Editable");
+    jclass sequence = env->FindClass("java/lang/CharSequence");
+    const jint length = env->CallIntMethod(content, env->GetMethodID(sequence, "length", "()I"));
+    jstring text = env->NewString(reinterpret_cast<const jchar *>(field_text.data()), jsize(field_text.size()));
+    env->CallObjectMethod(content, env->GetMethodID(editable_class, "replace", "(IILjava/lang/CharSequence;)Landroid/text/Editable;"), 0, length, text);
+    jclass base = env->FindClass("android/view/inputmethod/BaseInputConnection");
+    env->CallStaticVoidMethod(base, env->GetStaticMethodID(base, "removeComposingSpans", "(Landroid/text/Spannable;)V"), content);
+    jclass selection = env->FindClass("android/text/Selection");
+    const jint size = jint(field_text.size());
+    env->CallStaticVoidMethod(selection, env->GetStaticMethodID(selection, "setSelection", "(Landroid/text/Spannable;II)V"), content,
+                              std::clamp(field_anchor, 0, size), std::clamp(field_caret, 0, size));
+    if (exception(env, "seed editor")) return;
+    committed = field_text;
+}
+
 static void synchronize_text(JNIEnv *env, jobject self)
 {
     if (!connection || !env->IsSameObject(self, connection)) return;
     jobject content = editable(env, self);
     if (!content || exception(env, "read editor")) return;
+    if (state_mode) {
+        // What the input method made, whole: its text, composition and all,
+        // and its selection -- for the app to take as it is.
+        const auto now = characters(env, content);
+        jclass selection = env->FindClass("android/text/Selection");
+        const jint start = env->CallStaticIntMethod(selection, env->GetStaticMethodID(selection,
+            "getSelectionStart", "(Ljava/lang/CharSequence;)I"), content);
+        const jint end = env->CallStaticIntMethod(selection, env->GetStaticMethodID(selection,
+            "getSelectionEnd", "(Ljava/lang/CharSequence;)I"), content);
+        if (exception(env, "read editor state")) return;
+        const auto clamp = [&](jint at) { return size_t(std::clamp(at, jint(0), jint(now.size()))); };
+        const std::string text = utf8_of(now);
+        const int anchor = int(utf8_of(now.substr(0, clamp(start))).size());
+        const int caret = int(utf8_of(now.substr(0, clamp(end))).size());
+        {
+            const std::lock_guard<std::mutex> lock(edited_mutex);
+            edited_state = std::tuple{text, anchor, caret};
+        }
+        committed = now;
+        // The app woken for it: an empty composition, which the field it
+        // takes the state for lets go anyway.
+        tell(said::editing{"", 0});
+        return;
+    }
     auto text = characters(env, content);
     jclass base = env->FindClass("android/view/inputmethod/BaseInputConnection");
     jint first = env->CallStaticIntMethod(base, env->GetStaticMethodID(base,
@@ -185,10 +305,21 @@ static jboolean erase(JNIEnv *env, jobject self, jint before, jint after, bool p
     bool done = env->CallNonvirtualBooleanMethod(self, base, env->GetMethodID(base, method, "(II)Z"), before, after);
     if (!done || exception(env, "delete text")) return false;
     synchronize_text(env, self);
-    // The app can contain text typed before this input connection existed.
+    // The app can contain text typed before this input connection existed --
+    // not where it said what its field is: the connection's text is all of it.
+    if (state_mode) return true;
     for (size_t n = available_before; n < size_t(before); ++n) tell(said::tapped{SDL_SCANCODE_BACKSPACE});
     for (size_t n = available_after; n < size_t(after); ++n) tell(said::tapped{SDL_SCANCODE_DELETE});
     return true;
+}
+static jboolean select_text(JNIEnv *env, jobject self, jint start, jint end)
+{
+    Frame frame(env);
+    if (!frame) return false;
+    jclass base = env->FindClass("android/view/inputmethod/BaseInputConnection");
+    bool done = env->CallNonvirtualBooleanMethod(self, base, env->GetMethodID(base, "setSelection", "(II)Z"), start, end);
+    if (done && !exception(env, "select text")) synchronize_text(env, self);
+    return done;
 }
 static jboolean erase_units(JNIEnv *e, jobject s, jint b, jint a) { return erase(e, s, b, a, false); }
 static jboolean erase_points(JNIEnv *e, jobject s, jint b, jint a) { return erase(e, s, b, a, true); }
@@ -261,6 +392,13 @@ static jobject create_connection(JNIEnv *env, jobject self, jobject info)
         "<init>", "(Landroid/view/View;Z)V"), self, JNI_TRUE);
     connection = env->NewGlobalRef(made);
     committed.clear();
+    // The field's text and selection, where the app said them: the input
+    // method starts from where the app is.
+    if (state_mode) {
+        seed(env, made);
+        env->SetIntField(info, env->GetFieldID(cls, "initialSelStart", "I"), field_anchor);
+        env->SetIntField(info, env->GetFieldID(cls, "initialSelEnd", "I"), field_caret);
+    }
     return made;
 }
 
@@ -327,6 +465,8 @@ static void run(JNIEnv *env, jobject)
             jobject token = env->CallObjectMethod(input_view, env->GetMethodID(view, "getWindowToken", "()Landroid/os/IBinder;"));
             env->CallBooleanMethod(manager, env->GetMethodID(env->GetObjectClass(manager), "hideSoftInputFromWindow", "(Landroid/os/IBinder;I)Z"), token, 0);
             env->CallVoidMethod(input_view, env->GetMethodID(view, "clearFocus", "()V"));
+            // No field typed into: the next says what it is, else nothing.
+            state_mode = false;
             tell(said::keyboard_hidden{});
             break;
         }
@@ -350,6 +490,21 @@ static void run(JNIEnv *env, jobject)
         case Action::ping:
             ui_answered = request.stamp;
             break;
+        case Action::editor_state: {
+            field_text = utf16_of(request.text);
+            field_anchor = units_at(request.text, size_t(request.anchor));
+            field_caret = units_at(request.text, size_t(request.caret));
+            state_mode = true;
+            if (!connection || !input_view) break;
+            seed(env, connection);
+            // The input method told where the selection is now, and that
+            // nothing is being composed.
+            jobject manager = service(env, "input_method");
+            if (manager)
+                env->CallVoidMethod(manager, env->GetMethodID(env->GetObjectClass(manager), "updateSelection", "(Landroid/view/View;IIII)V"),
+                                    input_view, std::min(field_anchor, field_caret), std::max(field_anchor, field_caret), -1, -1);
+            break;
+        }
         }
         exception(env, "UI request");
     }
@@ -419,7 +574,8 @@ bool register_bridge(JNIEnv *env)
         NATIVE("finishComposingText", "()Z", finish),
         NATIVE("deleteSurroundingText", "(II)Z", erase_units),
         NATIVE("deleteSurroundingTextInCodePoints", "(II)Z", erase_points),
-        NATIVE("sendKeyEvent", "(Landroid/view/KeyEvent;)Z", key)
+        NATIVE("sendKeyEvent", "(Landroid/view/KeyEvent;)Z", key),
+        NATIVE("setSelection", "(II)Z", select_text)
     };
     const JNINativeMethod runner_methods[] = {NATIVE("run", "()V", run)};
 #undef NATIVE
@@ -467,4 +623,28 @@ extern "C" int SDL_TakeAndroidRequest(char *out, int size)
     std::copy_n(said.data(), copied, out);
     out[copied] = '\0';
     return int(copied) + 1;
+}
+
+// The field typed into, as the app says it is: its text, and its selection
+// in bytes of it.
+extern "C" void SDL_SetAndroidEditorState(const char *utf8, int anchor, int caret)
+{
+    native_activity::enqueue({native_activity::Action::editor_state, 0, {}, utf8 ? utf8 : "", 0, anchor, caret});
+}
+// What the input method made of it, whole: copied, taken, its selection in
+// bytes, and its length with its NUL; where `out` is too small or none,
+// that length negated and nothing taken; 0 where it made nothing new.
+extern "C" int SDL_TakeAndroidEditorState(char *out, int size, int *anchor, int *caret)
+{
+    const std::lock_guard<std::mutex> lock(native_activity::edited_mutex);
+    if (!native_activity::edited_state) return 0;
+    const auto &[text, from, to] = *native_activity::edited_state;
+    const int needed = int(text.size()) + 1;
+    if (!out || size < needed) return -needed;
+    std::copy_n(text.data(), text.size(), out);
+    out[text.size()] = '\0';
+    if (anchor) *anchor = from;
+    if (caret) *caret = to;
+    native_activity::edited_state.reset();
+    return needed;
 }

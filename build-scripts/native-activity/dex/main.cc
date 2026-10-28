@@ -60,6 +60,7 @@ std::vector<dex::Class> describe(dex::Pool &pool, const std::string &library) {
   method(connection, "deleteSurroundingText", "Z", {"I", "I"});
   method(connection, "deleteSurroundingTextInCodePoints", "Z", {"I", "I"});
   method(connection, "sendKeyEvent", "Z", {"Landroid/view/KeyEvent;"});
+  method(connection, "setSelection", "Z", {"I", "I"});
   classes.push_back(std::move(connection));
 
   dex::Class runner(pool, prefix + "Runner;", "Ljava/lang/Object;", {"Ljava/lang/Runnable;"}, public_ | final_);
