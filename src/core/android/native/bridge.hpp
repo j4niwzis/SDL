@@ -23,6 +23,9 @@ extern "C" {
 #include <variant>
 #include <vector>
 
+// Whether the app asked for Back itself (SDL_HINT_ANDROID_TRAP_BACK_BUTTON).
+bool Android_BackButtonTrapped(void);
+
 namespace native_activity {
 extern android_app *app;
 extern JavaVM *vm;

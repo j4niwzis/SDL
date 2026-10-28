@@ -493,6 +493,7 @@ void Android_LockActivityMutex() { SDL_LockMutex(activity_mutex); }
 void Android_UnlockActivityMutex() { SDL_UnlockMutex(activity_mutex); }
 void Android_SetAllowRecreateActivity(bool) {}
 void Android_JNI_SetBackButtonTrapActive(bool enabled) { back_trapped = enabled; }
+bool Android_BackButtonTrapped(void) { return back_trapped; }
 
 void Android_SendLifecycleEvent(SDL_AndroidLifecycleEvent event)
 {

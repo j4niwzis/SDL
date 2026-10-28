@@ -201,8 +201,13 @@ static jboolean key(JNIEnv *env, jobject, jobject event)
     jint code = env->CallIntMethod(event, env->GetMethodID(cls, "getKeyCode", "()I"));
     jint action = env->CallIntMethod(event, env->GetMethodID(cls, "getAction", "()I"));
     if (exception(env, "read key event")) return false;
-    // Let Android handle system navigation and volume keys.
-    if (code == AKEYCODE_BACK || code == AKEYCODE_VOLUME_UP || code == AKEYCODE_VOLUME_DOWN) return false;
+    // Back, where the app traps it, is the app's -- as the native input queue
+    // gives it (activity.cpp): from the input view, which has the focus while
+    // a text field does, it went to Android, and the back gesture left the
+    // app instead of stepping back in it. With the keyboard up, the IME takes
+    // Back first (pre_ime) and closes it. Volume keys stay Android's.
+    if (code == AKEYCODE_BACK && !Android_BackButtonTrapped()) return false;
+    if (code == AKEYCODE_VOLUME_UP || code == AKEYCODE_VOLUME_DOWN) return false;
     if (action == AKEY_EVENT_ACTION_DOWN) tell(said::key_down{code});
     else if (action == AKEY_EVENT_ACTION_UP) tell(said::key_up{code});
     if (action == AKEY_EVENT_ACTION_DOWN) {
