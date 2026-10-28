@@ -269,6 +269,9 @@ static void create(JNIEnv *env, jobject self, jobject saved)
     jclass base = env->FindClass("android/app/NativeActivity");
     env->CallNonvirtualVoidMethod(self, base, env->GetMethodID(base, "onCreate", "(Landroid/os/Bundle;)V"), saved);
     if (exception(env, "create native activity")) return;
+    // Started by a notification pressed: what it asks.
+    take_request(env, env->CallObjectMethod(self, env->GetMethodID(base, "getIntent", "()Landroid/content/Intent;")));
+    exception(env, "read starting intent");
     jobject view = env->NewObject(view_class, env->GetMethodID(view_class, "<init>", "(Landroid/content/Context;)V"), self);
     input_view = env->NewGlobalRef(view);
     runner = env->NewGlobalRef(env->NewObject(runner_class, env->GetMethodID(runner_class, "<init>", "()V")));
@@ -357,6 +360,36 @@ static void result(JNIEnv *env, jobject, jint request, jint answer, jobject inte
     document_result(env, request, answer, intent);
 }
 
+// What an intent that brought the activity up asks of the app -- a
+// notification's: its chat -- kept for the app to take
+// (SDL_TakeAndroidRequest), and taken off the intent, so that the activity
+// made again does not ask it twice.
+static std::mutex requested_mutex;
+static std::deque<std::string> requested;
+static constexpr const char *kRequestExtra = "org.libsdl.app.request";
+static void take_request(JNIEnv *env, jobject intent)
+{
+    if (!intent) return;
+    jclass cls = env->GetObjectClass(intent);
+    jstring key = env->NewStringUTF(kRequestExtra);
+    auto said = static_cast<jstring>(env->CallObjectMethod(intent,
+        env->GetMethodID(cls, "getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;"), key));
+    if (exception(env, "read intent") || !said) return;
+    std::string text = utf8(env, said);
+    env->CallVoidMethod(intent, env->GetMethodID(cls, "removeExtra", "(Ljava/lang/String;)V"), key);
+    exception(env, "consume intent");
+    const std::lock_guard<std::mutex> lock(requested_mutex);
+    requested.push_back(std::move(text));
+}
+static void new_intent(JNIEnv *env, jobject self, jobject intent)
+{
+    jclass base = env->FindClass("android/app/NativeActivity");
+    env->CallNonvirtualVoidMethod(self, base, env->GetMethodID(base, "onNewIntent", "(Landroid/content/Intent;)V"), intent);
+    env->CallVoidMethod(self, env->GetMethodID(base, "setIntent", "(Landroid/content/Intent;)V"), intent);
+    if (exception(env, "new intent")) return;
+    take_request(env, intent);
+}
+
 bool register_bridge(JNIEnv *env)
 {
     const auto load = [env](const char *name, jclass &where, const JNINativeMethod *methods, int count) {
@@ -369,7 +402,8 @@ bool register_bridge(JNIEnv *env)
 #define NATIVE(name, signature, function) {const_cast<char *>(name), const_cast<char *>(signature), reinterpret_cast<void *>(function)}
     const JNINativeMethod activity_methods[] = {
         NATIVE("onCreate", "(Landroid/os/Bundle;)V", create),
-        NATIVE("onActivityResult", "(IILandroid/content/Intent;)V", result)
+        NATIVE("onActivityResult", "(IILandroid/content/Intent;)V", result),
+        NATIVE("onNewIntent", "(Landroid/content/Intent;)V", new_intent)
     };
     const JNINativeMethod view_methods[] = {
         NATIVE("onCheckIsTextEditor", "()Z", editor),
@@ -420,3 +454,17 @@ bool request_document(int type, const char *name) { return enqueue({Action::docu
 void Android_JNI_SetActivityTitle(const char *title) { native_activity::enqueue({native_activity::Action::title, 0, {}, title}); }
 void Android_JNI_MinimizeWindow() { native_activity::enqueue({native_activity::Action::minimize}); }
 bool Android_JNI_OpenURL(const char *url) { return native_activity::enqueue({native_activity::Action::open_url, 0, {}, url}); }
+
+// What an intent asked of the app, the oldest first: its length, and copied
+// into `out` (cut to `size`, ended with a NUL); 0 where nothing was asked.
+extern "C" int SDL_TakeAndroidRequest(char *out, int size)
+{
+    const std::lock_guard<std::mutex> lock(native_activity::requested_mutex);
+    if (native_activity::requested.empty() || !out || size <= 0) return 0;
+    const std::string said = std::move(native_activity::requested.front());
+    native_activity::requested.pop_front();
+    const size_t copied = std::min(said.size(), size_t(size - 1));
+    std::copy_n(said.data(), copied, out);
+    out[copied] = '\0';
+    return int(copied) + 1;
+}

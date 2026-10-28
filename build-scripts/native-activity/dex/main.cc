@@ -39,6 +39,7 @@ std::vector<dex::Class> describe(dex::Pool &pool, const std::string &library) {
   activity.method("<clinit>", "V", {}, static_ | constructor_, init, true);
   method(activity, "onCreate", "V", {"Landroid/os/Bundle;"}, protected_);
   method(activity, "onActivityResult", "V", {"I", "I", "Landroid/content/Intent;"}, protected_);
+  method(activity, "onNewIntent", "V", {"Landroid/content/Intent;"}, protected_);
   classes.push_back(std::move(activity));
 
   dex::Class view(pool, prefix + "InputView;", "Landroid/view/View;", {}, public_ | final_);
