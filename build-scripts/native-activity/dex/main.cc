@@ -63,6 +63,19 @@ std::vector<dex::Class> describe(dex::Pool &pool, const std::string &library) {
   method(connection, "setSelection", "Z", {"I", "I"});
   classes.push_back(std::move(connection));
 
+  // A broadcast the app's own notifications send it -- an action pressed,
+  // a reply typed -- taken by the app without bringing it up. Its library
+  // loaded as the activity's is: Android may start the process for it.
+  dex::Class receiver(pool, prefix + "Receiver;", "Landroid/content/BroadcastReceiver;", {}, public_ | final_);
+  constructor(receiver, "Landroid/content/BroadcastReceiver;", {});
+  auto loads = std::make_shared<dex::Code>(pool, 1, 0, 1);
+  loads->constantString(0, library);
+  loads->callStatic({0}, {"Ljava/lang/System;", "loadLibrary", "V", {"Ljava/lang/String;"}});
+  loads->returnVoid();
+  receiver.method("<clinit>", "V", {}, static_ | constructor_, loads, true);
+  method(receiver, "onReceive", "V", {"Landroid/content/Context;", "Landroid/content/Intent;"});
+  classes.push_back(std::move(receiver));
+
   dex::Class runner(pool, prefix + "Runner;", "Ljava/lang/Object;", {"Ljava/lang/Runnable;"}, public_ | final_);
   constructor(runner, "Ljava/lang/Object;", {});
   method(runner, "run", "V", {});
@@ -97,5 +110,5 @@ int main(int argc, char **argv) {
     std::println(std::cerr, "cannot write {}", *out);
     return 1;
   }
-  std::println("{}: {} bytes, four native callback classes, loading lib{}.so", *out, bytes.size(), library);
+  std::println("{}: {} bytes, five native callback classes, loading lib{}.so", *out, bytes.size(), library);
 }

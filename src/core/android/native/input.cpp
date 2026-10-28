@@ -8,7 +8,7 @@
 #include <tuple>
 
 namespace native_activity {
-static jclass activity_class, view_class, connection_class, runner_class;
+static jclass activity_class, view_class, connection_class, runner_class, receiver_class;
 static jobject input_view, connection, runner;
 static int input_type = 1;
 static void take_request(JNIEnv *env, jobject intent);
@@ -533,8 +533,33 @@ static void take_request(JNIEnv *env, jobject intent)
     std::string text = utf8(env, said);
     env->CallVoidMethod(intent, env->GetMethodID(cls, "removeExtra", "(Ljava/lang/String;)V"), key);
     exception(env, "consume intent");
+    // A reply typed in a notification (RemoteInput, org.libsdl.app.reply):
+    // its text after the request, a line on.
+    jclass remote = env->FindClass("android/app/RemoteInput");
+    if (remote && !exception(env, "find RemoteInput")) {
+        jobject results = env->CallStaticObjectMethod(remote, env->GetStaticMethodID(remote, "getResultsFromIntent",
+            "(Landroid/content/Intent;)Landroid/os/Bundle;"), intent);
+        if (results && !exception(env, "read reply")) {
+            jobject reply = env->CallObjectMethod(results, env->GetMethodID(env->GetObjectClass(results), "getCharSequence",
+                "(Ljava/lang/String;)Ljava/lang/CharSequence;"), env->NewStringUTF("org.libsdl.app.reply"));
+            if (reply && !exception(env, "read reply text")) {
+                auto typed = static_cast<jstring>(env->CallObjectMethod(reply,
+                    env->GetMethodID(env->GetObjectClass(reply), "toString", "()Ljava/lang/String;")));
+                if (typed && !exception(env, "reply as text")) text += "\n" + utf8(env, typed);
+            }
+        }
+    }
     const std::lock_guard<std::mutex> lock(requested_mutex);
     requested.push_back(std::move(text));
+}
+// A broadcast from a notification: its request kept, and the app woken
+// for it -- an empty composition, which nothing takes for anything.
+static void receive(JNIEnv *env, jobject, jobject, jobject intent)
+{
+    Frame frame(env);
+    if (!frame) return;
+    take_request(env, intent);
+    tell(said::editing{"", 0});
 }
 static void new_intent(JNIEnv *env, jobject self, jobject intent)
 {
@@ -578,11 +603,15 @@ bool register_bridge(JNIEnv *env)
         NATIVE("setSelection", "(II)Z", select_text)
     };
     const JNINativeMethod runner_methods[] = {NATIVE("run", "()V", run)};
+    const JNINativeMethod receiver_methods[] = {
+        NATIVE("onReceive", "(Landroid/content/Context;Landroid/content/Intent;)V", receive)
+    };
 #undef NATIVE
     return load("org/libsdl/nativeapp/NativeActivity", activity_class, activity_methods, SDL_arraysize(activity_methods)) &&
            load("org/libsdl/nativeapp/InputView", view_class, view_methods, SDL_arraysize(view_methods)) &&
            load("org/libsdl/nativeapp/InputConnection", connection_class, connection_methods, SDL_arraysize(connection_methods)) &&
-           load("org/libsdl/nativeapp/Runner", runner_class, runner_methods, SDL_arraysize(runner_methods));
+           load("org/libsdl/nativeapp/Runner", runner_class, runner_methods, SDL_arraysize(runner_methods)) &&
+           load("org/libsdl/nativeapp/Receiver", receiver_class, receiver_methods, SDL_arraysize(receiver_methods));
 }
 
 void release_bridge(JNIEnv *env)

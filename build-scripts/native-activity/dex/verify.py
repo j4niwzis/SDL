@@ -78,13 +78,13 @@ def verify(path):
     bridge = (Path(__file__).resolve().parents[3] / 'src/core/android/native/input.cpp').read_text()
     registered = set()
     for name, cls in (('activity', 'NativeActivity'), ('view', 'InputView'),
-                      ('connection', 'InputConnection'), ('runner', 'Runner')):
+                      ('connection', 'InputConnection'), ('runner', 'Runner'), ('receiver', 'Receiver')):
         body = re.search(r'const JNINativeMethod ' + name + r'_methods\[\] = \{(.*?)\};', bridge, re.S).group(1)
         for method, signature in re.findall(r'NATIVE\("([^"]+)", "([^"]+)"', body):
             registered.add(('Lorg/libsdl/nativeapp/' + cls + ';', method, signature))
     assert native == registered, f'DEX/JNI mismatch: {native ^ registered}'
-    assert u32(96) == 4, 'expected four callback classes'
-    print(f'{path}: checksums, empty tables, four classes, {len(native)} JNI signatures verified')
+    assert u32(96) == 5, 'expected five callback classes'
+    print(f'{path}: checksums, empty tables, five classes, {len(native)} JNI signatures verified')
 
 
 if __name__ == '__main__':
