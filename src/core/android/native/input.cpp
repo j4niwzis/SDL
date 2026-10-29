@@ -496,6 +496,25 @@ static void run(JNIEnv *env, jobject)
             field_caret = units_at(request.text, size_t(request.caret));
             state_mode = true;
             if (!connection || !input_view) break;
+            // What the input method made since the app last heard of it --
+            // not taken by the app yet, or typed after the state it took --
+            // is newer than what the app says now: the app's state was
+            // made before it. Seeded over it, what was typed in between was
+            // gone from the connection, and the next state the input method
+            // made, from what was left, took it out of the app's field too:
+            // words, and whole lines, went from what was being written (a
+            // user's). Left, the app takes the input method's first: a
+            // change of its own made in between gives way to what was
+            // typed, never the other way round.
+            {
+                bool pending;
+                {
+                    const std::lock_guard<std::mutex> lock(edited_mutex);
+                    pending = edited_state.has_value();
+                }
+                jobject content = editable(env, connection);
+                if (pending || !content || characters(env, content) != committed) break;
+            }
             seed(env, connection);
             // The input method told where the selection is now, and that
             // nothing is being composed.
