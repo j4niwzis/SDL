@@ -583,7 +583,7 @@ static void receive(JNIEnv *env, jobject, jobject, jobject intent)
 }
 // What UnifiedPush's distributor tells the app, kept for it to take
 // (SDL_WaitAndroidPush) as "<what>\n<token>\n<value>": endpoint (its URL),
-// message, unregistered, failed (the reason). Only what the connector's
+// message (its id, to acknowledge), unregistered, failed (the reason). Only what the connector's
 // specification names; any other action dropped.
 static std::mutex pushed_mutex;
 static std::condition_variable pushed_ready;
@@ -607,7 +607,7 @@ static void push_receive(JNIEnv *env, jobject, jobject, jobject intent)
     struct kind { const char *action, *what, *extra; };
     static constexpr kind kinds[] = {
         {"org.unifiedpush.android.connector.NEW_ENDPOINT", "endpoint", "endpoint"},
-        {"org.unifiedpush.android.connector.MESSAGE", "message", nullptr},
+        {"org.unifiedpush.android.connector.MESSAGE", "message", "id"},
         {"org.unifiedpush.android.connector.UNREGISTERED", "unregistered", nullptr},
         {"org.unifiedpush.android.connector.REGISTRATION_FAILED", "failed", "reason"},
     };
