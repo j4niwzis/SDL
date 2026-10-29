@@ -2,13 +2,14 @@
 // JNI callbacks for the source-generated bridge in the j4niwzis fork.
 #include "bridge.hpp"
 #include <algorithm>
+#include <condition_variable>
 #include <mutex>
 #include <deque>
 #include <optional>
 #include <tuple>
 
 namespace native_activity {
-static jclass activity_class, view_class, connection_class, runner_class, receiver_class;
+static jclass activity_class, view_class, connection_class, runner_class, receiver_class, push_receiver_class;
 static jobject input_view, connection, runner;
 static int input_type = 1;
 static void take_request(JNIEnv *env, jobject intent);
@@ -580,6 +581,46 @@ static void receive(JNIEnv *env, jobject, jobject, jobject intent)
     take_request(env, intent);
     tell(said::editing{"", 0});
 }
+// What UnifiedPush's distributor tells the app, kept for it to take
+// (SDL_WaitAndroidPush) as "<what>\n<token>\n<value>": endpoint (its URL),
+// message, unregistered, failed (the reason). Only what the connector's
+// specification names; any other action dropped.
+static std::mutex pushed_mutex;
+static std::condition_variable pushed_ready;
+static std::deque<std::string> pushed;
+static bool push_woken = false;
+static std::string extra_string(JNIEnv *env, jobject intent, const char *name)
+{
+    auto said = static_cast<jstring>(env->CallObjectMethod(intent, env->GetMethodID(env->GetObjectClass(intent), "getStringExtra",
+        "(Ljava/lang/String;)Ljava/lang/String;"), env->NewStringUTF(name)));
+    if (exception(env, "read push extra") || !said) return {};
+    return utf8(env, said);
+}
+static void push_receive(JNIEnv *env, jobject, jobject, jobject intent)
+{
+    Frame frame(env);
+    if (!frame || !intent) return;
+    auto action = static_cast<jstring>(env->CallObjectMethod(intent, env->GetMethodID(env->GetObjectClass(intent), "getAction",
+        "()Ljava/lang/String;")));
+    if (exception(env, "read push action") || !action) return;
+    const std::string named = utf8(env, action);
+    struct kind { const char *action, *what, *extra; };
+    static constexpr kind kinds[] = {
+        {"org.unifiedpush.android.connector.NEW_ENDPOINT", "endpoint", "endpoint"},
+        {"org.unifiedpush.android.connector.MESSAGE", "message", nullptr},
+        {"org.unifiedpush.android.connector.UNREGISTERED", "unregistered", nullptr},
+        {"org.unifiedpush.android.connector.REGISTRATION_FAILED", "failed", "reason"},
+    };
+    const auto found = std::ranges::find(kinds, std::string_view(named), &kind::action);
+    if (found == std::ranges::end(kinds)) return;
+    std::string text = std::string(found->what) + "\n" + extra_string(env, intent, "token") + "\n" +
+                       (found->extra ? extra_string(env, intent, found->extra) : std::string());
+    {
+        const std::lock_guard<std::mutex> lock(pushed_mutex);
+        pushed.push_back(std::move(text));
+    }
+    pushed_ready.notify_all();
+}
 static void new_intent(JNIEnv *env, jobject self, jobject intent)
 {
     jclass base = env->FindClass("android/app/NativeActivity");
@@ -625,12 +666,16 @@ bool register_bridge(JNIEnv *env)
     const JNINativeMethod receiver_methods[] = {
         NATIVE("onReceive", "(Landroid/content/Context;Landroid/content/Intent;)V", receive)
     };
+    const JNINativeMethod push_receiver_methods[] = {
+        NATIVE("onReceive", "(Landroid/content/Context;Landroid/content/Intent;)V", push_receive)
+    };
 #undef NATIVE
     return load("org/libsdl/nativeapp/NativeActivity", activity_class, activity_methods, SDL_arraysize(activity_methods)) &&
            load("org/libsdl/nativeapp/InputView", view_class, view_methods, SDL_arraysize(view_methods)) &&
            load("org/libsdl/nativeapp/InputConnection", connection_class, connection_methods, SDL_arraysize(connection_methods)) &&
            load("org/libsdl/nativeapp/Runner", runner_class, runner_methods, SDL_arraysize(runner_methods)) &&
-           load("org/libsdl/nativeapp/Receiver", receiver_class, receiver_methods, SDL_arraysize(receiver_methods));
+           load("org/libsdl/nativeapp/Receiver", receiver_class, receiver_methods, SDL_arraysize(receiver_methods)) &&
+           load("org/libsdl/nativeapp/PushReceiver", push_receiver_class, push_receiver_methods, SDL_arraysize(push_receiver_methods));
 }
 
 void release_bridge(JNIEnv *env)
@@ -659,6 +704,35 @@ void Android_JNI_SetActivityTitle(const char *title) { native_activity::enqueue(
 void Android_JNI_MinimizeWindow() { native_activity::enqueue({native_activity::Action::minimize}); }
 bool Android_JNI_OpenURL(const char *url) { return native_activity::enqueue({native_activity::Action::open_url, 0, {}, url}); }
 
+// What UnifiedPush's distributor said, the oldest first, waited for: its
+// length, and copied into `out` (cut to `size`, ended with a NUL); -1 where
+// SDL_WakeAndroidPush woke the wait with nothing come.
+extern "C" int SDL_WaitAndroidPush(char *out, int size)
+{
+    std::unique_lock<std::mutex> lock(native_activity::pushed_mutex);
+    native_activity::pushed_ready.wait(lock, [] { return native_activity::push_woken || !native_activity::pushed.empty(); });
+    if (native_activity::pushed.empty()) {
+        native_activity::push_woken = false;
+        return -1;
+    }
+    const std::string text = std::move(native_activity::pushed.front());
+    native_activity::pushed.pop_front();
+    if (out && size > 0) {
+        const auto kept = std::min<std::size_t>(text.size(), static_cast<std::size_t>(size - 1));
+        std::copy_n(text.data(), kept, out);
+        out[kept] = '\0';
+    }
+    return static_cast<int>(text.size());
+}
+// The wait above ended, from another thread: the app stopping its push.
+extern "C" void SDL_WakeAndroidPush(void)
+{
+    {
+        const std::lock_guard<std::mutex> lock(native_activity::pushed_mutex);
+        native_activity::push_woken = true;
+    }
+    native_activity::pushed_ready.notify_all();
+}
 // What an intent asked of the app, the oldest first: its length, and copied
 // into `out` (cut to `size`, ended with a NUL); 0 where nothing was asked.
 extern "C" int SDL_TakeAndroidRequest(char *out, int size)

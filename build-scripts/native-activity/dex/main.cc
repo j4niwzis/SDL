@@ -76,6 +76,19 @@ std::vector<dex::Class> describe(dex::Pool &pool, const std::string &library) {
   method(receiver, "onReceive", "V", {"Landroid/content/Context;", "Landroid/content/Intent;"});
   classes.push_back(std::move(receiver));
 
+  // UnifiedPush's broadcasts to the app (org.unifiedpush.android.connector.*):
+  // a receiver of their own, exported for the distributor to reach -- the
+  // one above stays the app's alone. Its library loaded the same way.
+  dex::Class pushes(pool, prefix + "PushReceiver;", "Landroid/content/BroadcastReceiver;", {}, public_ | final_);
+  constructor(pushes, "Landroid/content/BroadcastReceiver;", {});
+  auto push_loads = std::make_shared<dex::Code>(pool, 1, 0, 1);
+  push_loads->constantString(0, library);
+  push_loads->callStatic({0}, {"Ljava/lang/System;", "loadLibrary", "V", {"Ljava/lang/String;"}});
+  push_loads->returnVoid();
+  pushes.method("<clinit>", "V", {}, static_ | constructor_, push_loads, true);
+  method(pushes, "onReceive", "V", {"Landroid/content/Context;", "Landroid/content/Intent;"});
+  classes.push_back(std::move(pushes));
+
   dex::Class runner(pool, prefix + "Runner;", "Ljava/lang/Object;", {"Ljava/lang/Runnable;"}, public_ | final_);
   constructor(runner, "Ljava/lang/Object;", {});
   method(runner, "run", "V", {});
