@@ -340,6 +340,43 @@ static jboolean key(JNIEnv *env, jobject, jobject event)
     // Back first (pre_ime) and closes it. Volume keys stay Android's.
     if (code == AKEYCODE_BACK && !Android_BackButtonTrapped()) return false;
     if (code == AKEYCODE_VOLUME_UP || code == AKEYCODE_VOLUME_DOWN) return false;
+    // Where the app said what its field is, the connection's text is the
+    // field's: a key that types or deletes -- a digit, a space, Backspace,
+    // as a keyboard sends some of them as keys -- is done to that text, and
+    // the field takes it with the rest of what the input method made. Told
+    // to the app as text and keys beside it, the field had it and the
+    // connection did not: the next state the input method made, from its
+    // text without it, took it out again -- digits gone at once, a space or
+    // a letter that would not be deleted (a tester's, on Android).
+    if (state_mode && connection) {
+        const jint c = action == AKEY_EVENT_ACTION_DOWN || action == AKEY_EVENT_ACTION_UP
+                           ? env->CallIntMethod(event, env->GetMethodID(cls, "getUnicodeChar", "()I")) : 0;
+        if (exception(env, "read key's character")) return false;
+        const bool deletes = code == AKEYCODE_DEL || code == AKEYCODE_FORWARD_DEL;
+        const bool types = c >= 32 && c <= 0x10ffff;
+        if (deletes || types) {
+            if (action == AKEY_EVENT_ACTION_DOWN) {
+                jobject content = editable(env, connection);
+                jclass selection = env->FindClass("android/text/Selection");
+                const jint start = env->CallStaticIntMethod(selection, env->GetStaticMethodID(selection,
+                    "getSelectionStart", "(Ljava/lang/CharSequence;)I"), content);
+                const jint end = env->CallStaticIntMethod(selection, env->GetStaticMethodID(selection,
+                    "getSelectionEnd", "(Ljava/lang/CharSequence;)I"), content);
+                if (exception(env, "read selection for a key")) return false;
+                if (types || start != end) {
+                    // Typed over what is selected, or what is selected deleted.
+                    char text[5]{};
+                    if (types) SDL_UCS4ToUTF8(c, text);
+                    commit(env, connection, env->NewStringUTF(text), 1);
+                } else if (code == AKEYCODE_DEL) {
+                    erase(env, connection, 1, 0, true);
+                } else {
+                    erase(env, connection, 0, 1, true);
+                }
+            }
+            return !exception(env, "key into the field's text");
+        }
+    }
     if (action == AKEY_EVENT_ACTION_DOWN) tell(said::key_down{code});
     else if (action == AKEY_EVENT_ACTION_UP) tell(said::key_up{code});
     if (action == AKEY_EVENT_ACTION_DOWN) {
